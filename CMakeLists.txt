@@ -94,6 +94,7 @@ endif()
 add_library(
     kv_core
     STATIC
+        src/kv_engine.cpp
         src/version.cpp
 )
 
@@ -131,6 +132,7 @@ if(BUILD_TESTING)
 
     add_executable(
         kv_tests
+        tests/kv_engine_test.cpp
         tests/version_test.cpp
     )
 

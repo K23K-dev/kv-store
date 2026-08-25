@@ -2,7 +2,24 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstddef>
+#include <latch>
 #include <string>
+#include <thread>
+#include <vector>
+
+namespace {
+
+// Keeping key construction here so worker and verification code don't accidentally generate keys
+// differently
+std::string artifact_key(std::size_t character_index, std::size_t artifact_index) {
+    return "artifact_" + std::to_string(character_index) + "_" + std::to_string(artifact_index);
+}
+
+}  // namespace
 
 TEST(KvEngineTest, StoresReadsAndOverwritesValues) {
     kv::KvEngine store;
@@ -96,4 +113,127 @@ TEST(KvEngineTest, ReturnsValueCopies) {
     EXPECT_EQ(store.put("active_party_member", "Furina"), kv::Status::kOk);
 
     EXPECT_EQ(original_result.value, "Yoimiya");
+}
+
+TEST(KvEngineTest, HandlesConcurrentReadsAndWrites) {
+    kv::KvEngine store;
+
+    const std::array<std::string, 8> characters{
+        "Yoimiya", "Furina", "Nahida", "Zhongli", "Venti", "Raiden Shogun", "Navia", "Neuvillette",
+    };
+
+    constexpr std::size_t kArtifactsPerCharacter = 200;
+
+    std::latch start_gate{static_cast<std::ptrdiff_t>(characters.size())};
+
+    std::atomic<bool> operations_valid{true};
+
+    std::vector<std::thread> workers;
+    workers.reserve(characters.size());
+
+    for (std::size_t character_index = 0; character_index < characters.size(); ++character_index) {
+        workers.emplace_back([&, character_index] {
+            start_gate.count_down();
+            start_gate.wait();
+
+            try {
+                const std::string& character = characters[character_index];
+
+                for (std::size_t artifact_index = 0; artifact_index < kArtifactsPerCharacter;
+                     ++artifact_index) {
+                    const std::string key = artifact_key(character_index, artifact_index);
+                    const kv::Status artifact_status = store.put(key, character);
+
+                    const kv::Status party_status = store.put("active_party_member", character);
+
+                    if (artifact_status != kv::Status::kOk || party_status != kv::Status::kOk) {
+                        operations_valid.store(false, std::memory_order_relaxed);
+                    }
+                    const kv::GetResult result = store.get("active_party_member");
+
+                    const bool allowed_value = std::find(characters.begin(), characters.end(),
+                                                         result.value) != characters.end();
+
+                    if (result.status != kv::Status::kOk || !allowed_value) {
+                        operations_valid.store(false, std::memory_order_relaxed);
+                    }
+                }
+            } catch (...) {
+                operations_valid.store(false, std::memory_order_relaxed);
+            }
+        });
+    }
+
+    // join waits for each worker to finish
+    for (std::thread& worker : workers) {
+        worker.join();
+    }
+
+    ASSERT_TRUE(operations_valid.load(std::memory_order_relaxed));
+
+    for (std::size_t character_index = 0; character_index < characters.size(); ++character_index) {
+        for (std::size_t artifact_index = 0; artifact_index < kArtifactsPerCharacter;
+             ++artifact_index) {
+            const std::string key = artifact_key(character_index, artifact_index);
+
+            const kv::GetResult result = store.get(key);
+
+            ASSERT_EQ(result.status, kv::Status::kOk) << key;
+            EXPECT_EQ(result.value, characters[character_index]) << key;
+        }
+    }
+}
+
+TEST(KvEngineTest, AllowsOnlyOneConcurrentErase) {
+    kv::KvEngine store;
+
+    ASSERT_EQ(store.put("limited_banner", "Yoimiya"), kv::Status::kOk);
+
+    constexpr std::size_t kEraserCount = 8;
+
+    std::latch start_gate{static_cast<std::ptrdiff_t>(kEraserCount)};
+
+    std::array<kv::Status, kEraserCount> results{};
+
+    std::atomic<bool> worker_failed{false};
+    std::vector<std::thread> workers;
+    workers.reserve(kEraserCount);
+
+    for (std::size_t worker_index = 0; worker_index < kEraserCount; ++worker_index) {
+        workers.emplace_back([&, worker_index] {
+            start_gate.count_down();
+            start_gate.wait();
+
+            try {
+                results[worker_index] = store.erase("limited_banner");
+            } catch (...) {
+                worker_failed.store(true, std::memory_order_relaxed);
+            }
+        });
+    }
+
+    for (std::thread& worker : workers) {
+        worker.join();
+    }
+
+    ASSERT_FALSE(worker_failed.load(std::memory_order_relaxed));
+
+    std::size_t erased_count = 0;
+
+    for (const kv::Status status : results) {
+        if (status == kv::Status::kOk) {
+            ++erased_count;
+        } else {
+            // Every thread that lost the race must report
+            // that the key was already missing
+            EXPECT_EQ(status, kv::Status::kNotFound);
+        }
+    }
+
+    EXPECT_EQ(erased_count, 1U);
+
+    const kv::GetResult result = store.get("limited_banner");
+
+    EXPECT_EQ(result.status, kv::Status::kNotFound);
+    EXPECT_TRUE(result.value.empty());
 }

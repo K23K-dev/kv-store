@@ -1,6 +1,8 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -30,9 +32,19 @@ class KvEngine final {
     [[nodiscard]] Status erase(std::string_view key);
 
    private:
+    static constexpr std::size_t kShardCount = 64;
+
+    struct Shard {
+        mutable std::shared_mutex mutex;
+
+        std::unordered_map<std::string, std::string> entries;
+    };
+
     [[nodiscard]] static Status validate_key(std::string_view key) noexcept;
 
-    std::unordered_map<std::string, std::string> entries_;
+    [[nodiscard]] static std::size_t shard_index(std::string_view key) noexcept;
+
+    std::array<Shard, kShardCount> shards_{};
 };
 
 }  // namespace kv

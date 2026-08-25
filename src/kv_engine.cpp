@@ -1,5 +1,8 @@
 #include "kv/kv_engine.hpp"
 
+#include <functional>
+#include <mutex>
+#include <shared_mutex>
 #include <utility>
 
 namespace kv {
@@ -15,7 +18,14 @@ Status KvEngine::put(std::string key, std::string value) {
         return Status::kValueTooLarge;
     }
 
-    entries_.insert_or_assign(std::move(key), std::move(value));
+    Shard& shard = shards_[shard_index(key)];
+
+    // Unique lock gives this writer exclusive access
+    std::unique_lock lock{shard.mutex};
+
+    shard.entries.insert_or_assign(std::move(key), std::move(value));
+
+    // The lock is automatically released when the function ends
     return Status::kOk;
 }
 
@@ -26,9 +36,15 @@ GetResult KvEngine::get(std::string_view key) const {
         return GetResult{key_status, {}};
     }
 
-    const auto entry = entries_.find(std::string{key});
+    const std::string owned_key{key};
 
-    if (entry == entries_.end()) {
+    const Shard& shard = shards_[shard_index(key)];
+
+    std::shared_lock lock{shard.mutex};
+
+    const auto entry = shard.entries.find(owned_key);
+
+    if (entry == shard.entries.end()) {
         return GetResult{Status::kNotFound, {}};
     }
 
@@ -42,7 +58,13 @@ Status KvEngine::erase(std::string_view key) {
         return key_status;
     }
 
-    if (entries_.erase(std::string{key}) == 0U) {
+    const std::string owned_key{key};
+    Shard& shard = shards_[shard_index(key)];
+
+    // Erasing changes the map so it requires exclusive access
+    std::unique_lock lock{shard.mutex};
+
+    if (shard.entries.erase(owned_key) == 0U) {
         return Status::kNotFound;
     }
 
@@ -59,6 +81,11 @@ Status KvEngine::validate_key(std::string_view key) noexcept {
     }
 
     return Status::kOk;
+}
+
+std::size_t KvEngine::shard_index(std::string_view key) noexcept {
+    // Modulo hashing maps the number into the range 0 to 63
+    return std::hash<std::string_view>{}(key) % kShardCount;
 }
 
 }  // namespace kv

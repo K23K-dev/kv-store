@@ -11,6 +11,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+find_package(Threads REQUIRED)
+
 option(
     KV_ENABLE_ASAN_UBSAN
     "Enable AddressSanitizer and UndefinedBehaviorSanitizer"
@@ -108,6 +110,8 @@ target_include_directories(
 
 target_link_libraries(
     kv_core
+    PUBLIC
+        Threads::Threads
     PRIVATE
         kv_project_options
 )
@@ -142,6 +146,7 @@ if(BUILD_TESTING)
             kv::core
             kv_project_options
             GTest::gtest_main
+            Threads::Threads
     )
 
     gtest_discover_tests(kv_tests)

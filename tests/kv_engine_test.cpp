@@ -5,13 +5,36 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <latch>
+#include <limits>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
 
 namespace {
+
+using namespace std::chrono_literals;
+
+class ManualClock final : public kv::Clock {
+   public:
+    explicit ManualClock(kv::Timestamp initial) noexcept
+        : now_ms_(initial.milliseconds_since_epoch) {}
+
+    [[nodiscard]] kv::Timestamp now() const noexcept override {
+        // Atomic loading keeps the fake clock thread-safe
+        return kv::Timestamp{now_ms_.load(std::memory_order_relaxed)};
+    }
+
+    void set(kv::Timestamp value) noexcept {
+        now_ms_.store(value.milliseconds_since_epoch, std::memory_order_relaxed);
+    }
+
+   private:
+    std::atomic<std::int64_t> now_ms_;
+};
 
 // Keeping key construction here so worker and verification code don't accidentally generate keys
 // differently
@@ -236,4 +259,109 @@ TEST(KvEngineTest, AllowsOnlyOneConcurrentErase) {
 
     EXPECT_EQ(result.status, kv::Status::kNotFound);
     EXPECT_TRUE(result.value.empty());
+}
+
+TEST(KvEngineTest, ExpiresValueAtDeadline) {
+    const auto clock = std::make_shared<ManualClock>(kv::Timestamp{100});
+
+    kv::KvEngine store{clock};
+
+    EXPECT_EQ(store.put("story_quest", "Dreamlike Timelessness", 10ms), kv::Status::kOk);
+
+    clock->set(kv::Timestamp{109});
+
+    const kv::GetResult before_deadline = store.get("story_quest");
+
+    ASSERT_EQ(before_deadline.status, kv::Status::kOk);
+
+    EXPECT_EQ(before_deadline.value, "Dreamlike Timelessness");
+
+    clock->set(kv::Timestamp{110});
+
+    const kv::GetResult at_deadline = store.get("story_quest");
+
+    EXPECT_EQ(at_deadline.status, kv::Status::kNotFound);
+
+    EXPECT_TRUE(at_deadline.value.empty());
+}
+
+TEST(KvEngineTest, ClearsExpirationWhenOverwrittenWithoutTtl) {
+    const auto clock = std::make_shared<ManualClock>(kv::Timestamp{100});
+
+    kv::KvEngine store{clock};
+
+    ASSERT_EQ(store.put("featured_character", "Yoimiya", 10ms), kv::Status::kOk);
+
+    clock->set(kv::Timestamp{109});
+
+    ASSERT_EQ(store.put("featured_character", "Furina"), kv::Status::kOk);
+
+    clock->set(kv::Timestamp{1000});
+
+    const kv::GetResult result = store.get("featured_character");
+
+    ASSERT_EQ(result.status, kv::Status::kOk);
+    EXPECT_EQ(result.value, "Furina");
+}
+
+TEST(KvEngineTest, ResetsExpirationWhenOverwritten) {
+    const auto clock = std::make_shared<ManualClock>(kv::Timestamp{100});
+
+    kv::KvEngine store{clock};
+
+    ASSERT_EQ(store.put("featured_character", "Yoimiya", 10ms), kv::Status::kOk);
+
+    clock->set(kv::Timestamp{100});
+
+    ASSERT_EQ(store.put("featured_character", "Navia", 20ms), kv::Status::kOk);
+
+    clock->set(kv::Timestamp{110});
+
+    const kv::GetResult after_old_deadline = store.get("featured_character");
+
+    ASSERT_EQ(after_old_deadline.status, kv::Status::kOk);
+
+    EXPECT_EQ(after_old_deadline.value, "Navia");
+
+    clock->set(kv::Timestamp{129});
+
+    EXPECT_EQ(store.get("featured_character").status, kv::Status::kNotFound);
+}
+
+TEST(KvEngineTest, RejectsInvalidTtlWithoutMutation) {
+    const auto clock = std::make_shared<ManualClock>(kv::Timestamp{100});
+
+    kv::KvEngine store{clock};
+
+    ASSERT_EQ(store.put("favorite_character", "Yoimiya"), kv::Status::kOk);
+
+    EXPECT_EQ(store.put("favorite_character", "Furina", 0ms), kv::Status::kInvalidTtl);
+
+    EXPECT_EQ(store.put("favorite_character", "Nahida", -1ms), kv::Status::kInvalidTtl);
+
+    clock->set(kv::Timestamp(std::numeric_limits<std::int64_t>::max() - 1));
+
+    EXPECT_EQ(store.put("favorite_character", "Zhongli", 2ms), kv::Status::kInvalidTtl);
+
+    const kv::GetResult result = store.get("favorite_character");
+
+    ASSERT_EQ(result.status, kv::Status::kOk);
+    EXPECT_EQ(result.value, "Yoimiya");
+}
+
+TEST(KvEngineTest, TreatsExpiredEraseAsMissing) {
+    const auto clock = std::make_shared<ManualClock>(kv::Timestamp{100});
+
+    kv::KvEngine store{clock};
+
+    ASSERT_EQ(store.put("limited_banner", "Yoimiya", 10ms), kv::Status::kOk);
+
+    clock->set(kv::Timestamp{110});
+
+    // Expired and missing have identical observable behavior
+    EXPECT_EQ(store.erase("limited_banner"), kv::Status::kNotFound);
+
+    EXPECT_EQ(store.erase("limited_banner"), kv::Status::kNotFound);
+
+    EXPECT_EQ(store.get("limited_banner").status, kv::Status::kNotFound);
 }
